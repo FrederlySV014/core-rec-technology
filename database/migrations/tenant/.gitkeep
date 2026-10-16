@@ -1,0 +1,2 @@
+# Commercial (tenant) migrations directory
+# All commercial ERP migrations must be placed here and executed only on tenant database connections.

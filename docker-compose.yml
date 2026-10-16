@@ -1,0 +1,33 @@
+services:
+    postgres:
+        image: postgres:16-alpine
+        container_name: core_rec_postgres
+        restart: unless-stopped
+        ports:
+            - '5434:5432'
+        environment:
+            POSTGRES_DB: core_rec_technology
+            POSTGRES_USER: postgres
+            POSTGRES_PASSWORD: secretpassword
+        volumes:
+            - core_rec_pgdata:/var/lib/postgresql/data
+        healthcheck:
+            test: ['CMD-SHELL', 'pg_isready -U postgres -d core_rec_technology']
+            interval: 5s
+            timeout: 5s
+            retries: 5
+
+    mailpit:
+        image: axllent/mailpit:latest
+        container_name: core_rec_mailpit
+        restart: unless-stopped
+        ports:
+            - '127.0.0.1:1025:1025'
+            - '127.0.0.1:8025:8025'
+        environment:
+            MP_MAX_MESSAGES: 500
+            MP_DATA_FILE: ''
+
+volumes:
+    core_rec_pgdata:
+        driver: local
