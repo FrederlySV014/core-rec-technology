@@ -18,7 +18,8 @@ class ProvisionTenantDatabaseJob implements ShouldQueue
     public function __construct(
         public int $companyId,
         public ?int $actorUserId = null,
-        public bool $isRetry = false
+        public bool $isRetry = false,
+        public bool $force = false
     ) {
         $this->afterCommit = true;
     }
@@ -31,6 +32,6 @@ class ProvisionTenantDatabaseJob implements ShouldQueue
         $company = Company::findOrFail($this->companyId);
         $actor = $this->actorUserId ? User::find($this->actorUserId) : null;
 
-        $service->provision($company, $actor, $this->isRetry);
+        $service->provision($company, $actor, $this->isRetry, $this->force);
     }
 }

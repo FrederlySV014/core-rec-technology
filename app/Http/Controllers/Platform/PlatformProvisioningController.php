@@ -73,9 +73,10 @@ class PlatformProvisioningController extends Controller
     {
         /** @var User $actor */
         $actor = $request->user();
+        $force = (bool) $request->boolean('force');
 
         try {
-            $connection = $service->retry($company, $actor);
+            $connection = $service->retry($company, $actor, force: $force);
 
             return response()->json([
                 'status' => 'success',

@@ -18,6 +18,7 @@ class TenantProvisionCommand extends Command
     protected $signature = 'tenant:provision 
                             {company : ID o slug de la empresa}
                             {--retry : Reintentar un aprovisionamiento previo fallido o incompleto}
+                            {--force : Forzar la recuperación de una ejecución bloqueada en curso}
                             {--queue : Despachar la tarea a la cola en segundo plano en lugar de ejecutar síncronamente}';
 
     /**
@@ -46,12 +47,13 @@ class TenantProvisionCommand extends Command
         }
 
         $isRetry = (bool) $this->option('retry');
+        $force = (bool) $this->option('force');
         $useQueue = (bool) $this->option('queue');
 
         $this->info("Iniciando proceso de aprovisionamiento para la empresa: [{$company->legal_name}] (ID: {$company->id})...");
 
         if ($useQueue) {
-            ProvisionTenantDatabaseJob::dispatch($company->id, null, $isRetry);
+            ProvisionTenantDatabaseJob::dispatch($company->id, null, $isRetry, $force);
             $this->info('Tarea de aprovisionamiento despachada a la cola exitosamente.');
             $this->comment('Asegúrate de tener un worker ejecutándose: php artisan queue:work');
 
@@ -60,8 +62,8 @@ class TenantProvisionCommand extends Command
 
         try {
             $connection = $isRetry
-                ? $service->retry($company)
-                : $service->provision($company);
+                ? $service->retry($company, force: $force)
+                : $service->provision($company, force: $force);
 
             $this->info('✓ Aprovisionamiento completado y verificado exitosamente.');
             $this->table(['Parámetro', 'Valor'], [

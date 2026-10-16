@@ -29,4 +29,14 @@ return [
         'db_prefix' => env('TENANT_DB_NAME_PREFIX', 'rec_tenant_'),
         'user_prefix' => env('TENANT_DB_USER_PREFIX', 'rec_'),
     ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Stale Execution Timeout
+    |--------------------------------------------------------------------------
+    | Time in minutes after which an 'in_progress' provisioning attempt is
+    | considered abandoned by an aborted worker, allowing safe recovery.
+    |
+    */
+    'stale_timeout_minutes' => (int) env('TENANT_DB_STALE_TIMEOUT_MINUTES', 15),
 ];

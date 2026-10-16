@@ -32,17 +32,32 @@ class TenantProvisioningService
      *
      * @throws ProvisioningException
      */
-    public function provision(Company $company, ?User $actor = null, bool $isRetry = false): CompanyDatabaseConnection
-    {
-        // 1. Pre-condition checks and concurrency lock
-        $this->ensureCanBeProvisioned($company, $isRetry);
+    /**
+     * Provision an independent commercial database for a company.
+     *
+     * @param  Company  $company  The company to provision.
+     * @param  User|null  $actor  The user initiating the provisioning.
+     * @param  bool  $isRetry  Whether this execution is an explicit retry.
+     * @param  bool  $force  Whether to force recovery of a stalled in-progress execution.
+     * @return CompanyDatabaseConnection The prepared and verified connection.
+     *
+     * @throws ProvisioningException
+     */
+    public function provision(
+        Company $company,
+        ?User $actor = null,
+        bool $isRetry = false,
+        bool $force = false
+    ): CompanyDatabaseConnection {
+        // 1. Atomic pre-condition verification and pessimistic row lock acquisition
+        $this->acquireProvisioningLock($company, $isRetry, $force);
 
         $startedAt = now();
-        $this->markStatus($company, ProvisioningStatus::InProgress);
 
         $this->audit($company, $actor, 'tenant.provisioning_started', [
             'is_retry' => $isRetry,
             'company_id' => $company->id,
+            'forced' => $force,
         ]);
 
         $stage = ProvisioningStage::CreateDatabase;
@@ -58,13 +73,34 @@ class TenantProvisioningService
             $this->assertValidIdentifier($migUsername);
             $this->assertValidIdentifier($appUsername);
 
-            // Resolve or generate passwords
-            $existingConn = $company->databaseConnection;
-            $migPassword = $existingConn?->migration_password ?: Str::random(32);
-            $appPassword = $existingConn?->app_password ?: Str::random(32);
-
             $host = (string) config('tenancy.provisioner.host', '127.0.0.1');
             $port = (int) config('tenancy.provisioner.port', 5432);
+
+            // Resolve or pre-persist connection credentials
+            // (Guarantees consistency across aborted runs and avoids unnecessary password rotations)
+            $existingConn = $company->databaseConnection;
+            if ($existingConn) {
+                $migPassword = $existingConn->migration_password;
+                $appPassword = $existingConn->app_password;
+            } else {
+                $migPassword = Str::random(32);
+                $appPassword = Str::random(32);
+
+                $existingConn = CompanyDatabaseConnection::create([
+                    'company_id' => $company->id,
+                    'driver' => 'pgsql',
+                    'host' => $host,
+                    'port' => $port,
+                    'database' => $dbName,
+                    'schema' => 'public',
+                    'app_username' => $appUsername,
+                    'app_password' => $appPassword,
+                    'migration_username' => $migUsername,
+                    'migration_password' => $migPassword,
+                    'ssl_mode' => 'prefer',
+                    'is_external_host' => false,
+                ]);
+            }
 
             // STAGE 1: Create Database & Technical Users in PostgreSQL
             $stage = ProvisioningStage::CreateDatabase;
@@ -111,13 +147,13 @@ class TenantProvisioningService
             $stage = ProvisioningStage::SeedData;
             $stageStart = now();
 
-            $this->seedTenantIdentity('tenant_migration', $company);
+            $this->seedTenantIdentity('tenant_migration', $company, $dbName, $appUsername);
 
             $this->recordLog($company, $stage, ProvisioningStatus::Ready, [
                 'verified_company_id' => $company->id,
             ], null, $actor, $stageStart);
 
-            // STAGE 4: Health Check (Verify App connection, identity & DDL restriction)
+            // STAGE 4: Health Check (Verify App connection, identity immutability & DDL restriction)
             $stage = ProvisioningStage::HealthCheck;
             $stageStart = now();
 
@@ -137,26 +173,20 @@ class TenantProvisioningService
             $this->recordLog($company, $stage, ProvisioningStatus::Ready, [
                 'connection_check' => 'passed',
                 'identity_check' => 'passed',
+                'identity_immutability_check' => 'passed',
                 'ddl_restriction_check' => 'passed',
             ], null, $actor, $stageStart);
 
-            // Save or update CompanyDatabaseConnection record (passwords encrypted automatically)
-            $connection = CompanyDatabaseConnection::updateOrCreate(
-                ['company_id' => $company->id],
-                [
-                    'driver' => 'pgsql',
-                    'host' => $host,
-                    'port' => $port,
-                    'database' => $dbName,
-                    'schema' => 'public',
-                    'app_username' => $appUsername,
-                    'app_password' => $appPassword,
-                    'migration_username' => $migUsername,
-                    'migration_password' => $migPassword,
-                    'ssl_mode' => 'prefer',
-                    'is_external_host' => false,
-                ]
-            );
+            // Ensure CompanyDatabaseConnection is fully synchronized
+            $existingConn->update([
+                'host' => $host,
+                'port' => $port,
+                'database' => $dbName,
+                'app_username' => $appUsername,
+                'app_password' => $appPassword,
+                'migration_username' => $migUsername,
+                'migration_password' => $migPassword,
+            ]);
 
             // Mark company as Ready
             $this->markStatus($company, ProvisioningStatus::Ready);
@@ -166,7 +196,7 @@ class TenantProvisioningService
                 'duration_seconds' => now()->diffInSeconds($startedAt),
             ]);
 
-            return $connection;
+            return $existingConn;
         } catch (Throwable $e) {
             $sanitizedMessage = $this->sanitizeErrorMessage($e->getMessage());
 
@@ -193,9 +223,9 @@ class TenantProvisioningService
     /**
      * Retry a failed or incomplete provisioning process.
      */
-    public function retry(Company $company, ?User $actor = null): CompanyDatabaseConnection
+    public function retry(Company $company, ?User $actor = null, bool $force = false): CompanyDatabaseConnection
     {
-        return $this->provision($company, $actor, isRetry: true);
+        return $this->provision($company, $actor, isRetry: true, force: $force);
     }
 
     /**
@@ -236,26 +266,78 @@ class TenantProvisioningService
     }
 
     /**
-     * Check if company can be provisioned.
+     * Atomically acquire the provisioning lock on the company using pessimistic row locking.
+     *
+     * @throws ProvisioningException
      */
-    protected function ensureCanBeProvisioned(Company $company, bool $isRetry): void
+    protected function acquireProvisioningLock(Company $company, bool $isRetry, bool $force = false): Company
+    {
+        return DB::connection('central')->transaction(function () use ($company, $isRetry, $force) {
+            /** @var Company|null $lockedCompany */
+            $lockedCompany = Company::where('id', $company->id)->lockForUpdate()->first();
+
+            if (! $lockedCompany) {
+                throw new ProvisioningException("Empresa [{$company->id}] no encontrada para bloqueo de aprovisionamiento.");
+            }
+
+            $this->ensureCanBeProvisioned($lockedCompany, $isRetry, $force);
+
+            $lockedCompany->update([
+                'technical_provisioning_status' => ProvisioningStatus::InProgress,
+            ]);
+
+            $company->refresh();
+
+            return $lockedCompany;
+        });
+    }
+
+    /**
+     * Check if company can be provisioned and evaluate abandoned execution timeouts.
+     */
+    protected function ensureCanBeProvisioned(Company $company, bool $isRetry, bool $force = false): void
     {
         if ($company->trashed() || $company->administrative_status === CompanyStatus::Cancelled) {
             throw new ProvisioningException('No se puede aprovisionar una empresa inactiva o cancelada.');
         }
 
-        if ($company->technical_provisioning_status === ProvisioningStatus::InProgress) {
-            throw new ProvisioningException('Ya existe un proceso de aprovisionamiento en curso para esta empresa.');
+        if ($company->technical_provisioning_status === ProvisioningStatus::Ready && ! $isRetry) {
+            throw new ProvisioningException('La empresa ya cuenta con una base comercial preparada y lista.');
         }
 
-        if ($company->technical_provisioning_status === ProvisioningStatus::Ready && ! $isRetry) {
-            // Already provisioned and not retrying
-            throw new ProvisioningException('La empresa ya cuenta con una base comercial preparada y lista.');
+        if ($company->technical_provisioning_status === ProvisioningStatus::InProgress) {
+            $staleMinutes = (int) config('tenancy.stale_timeout_minutes', 15);
+            $latestLog = $company->provisioningLogs()->latest('id')->first();
+            $startTime = $latestLog !== null ? $latestLog->started_at : $company->updated_at;
+            $elapsedMinutes = $startTime ? (int) abs(now()->diffInMinutes($startTime)) : 0;
+
+            $isStale = $elapsedMinutes >= $staleMinutes;
+
+            if (! $isStale && ! $force) {
+                throw new ProvisioningException("Ya existe un proceso de aprovisionamiento en curso para esta empresa (iniciado hace {$elapsedMinutes} min). No se permite una segunda ejecución mientras la primera siga activa.");
+            }
+
+            if (! $isRetry && ! $force) {
+                throw new ProvisioningException("El aprovisionamiento previo quedó en estado 'en curso' pero parece abandonado (iniciado hace {$elapsedMinutes} min). Para retomarlo de forma segura utilice la opción de reintento (--retry) o recuperación forzada.");
+            }
+
+            $this->recordLog(
+                $company,
+                ProvisioningStage::CreateDatabase,
+                ProvisioningStatus::Failed,
+                [
+                    'recovery' => 'abandoned_execution_recovery',
+                    'elapsed_minutes' => $elapsedMinutes,
+                    'forced' => $force,
+                ],
+                $force ? 'Recuperación forzada por operador' : "Recuperación de ejecución abandonada por tiempo de espera ({$elapsedMinutes} min transcurridos)"
+            );
         }
     }
 
     /**
      * Create PostgreSQL database and roles with least-privilege boundary.
+     * Enforces Database Engine Discretionary Access Control (DAC) via REVOKE CONNECT FROM PUBLIC.
      */
     protected function createDatabaseAndRoles(
         Company $company,
@@ -266,6 +348,9 @@ class TenantProvisioningService
         string $appPassword,
         bool $isRetry
     ): void {
+        // Enforce DAC connection isolation on the project-managed central database
+        $this->restrictCentralDatabasePublicAccess();
+
         $pdo = $this->getAdminPdo();
 
         // 1. Check if database already exists
@@ -281,7 +366,8 @@ class TenantProvisioningService
             $pdo->exec(sprintf('CREATE DATABASE "%s" WITH ENCODING %s', $dbName, $pdo->quote('UTF8')));
         }
 
-        // 2. Revoke public connect privilege on this database (prevent other tenants from connecting)
+        // 2. Discretionary Access Control (DAC): Revoke public connect privilege on this tenant database
+        // (Ensures other database roles in PostgreSQL cannot connect to this tenant database)
         $pdo->exec(sprintf('REVOKE CONNECT ON DATABASE "%s" FROM PUBLIC', $dbName));
 
         // 3. Create or update migration role (DDL privileges)
@@ -328,35 +414,61 @@ class TenantProvisioningService
             $appUsername
         ));
 
-        // If tables already exist (retry scenario), grant permissions immediately
+        // If tables already exist (retry scenario), grant permissions to appUsername
         $dbPdo->exec(sprintf('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO "%s"', $appUsername));
         $dbPdo->exec(sprintf('GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO "%s"', $appUsername));
+
+        // Always re-enforce that tenant_identity table is strictly read-only for appUsername if it exists
+        $stmtIdentity = $dbPdo->query("SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'tenant_identity'");
+        if ($stmtIdentity && $stmtIdentity->fetchColumn()) {
+            $dbPdo->exec(sprintf('REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON TABLE tenant_identity FROM "%s"', $appUsername));
+            $dbPdo->exec(sprintf('GRANT SELECT ON TABLE tenant_identity TO "%s"', $appUsername));
+        }
     }
 
     /**
-     * Verify an existing database belongs to the company, or throw if mismatched.
+     * Verify an existing database belongs to the company, or throw if mismatched/unknown.
+     * Uses platform provenance to recognize interrupted creations without adopting unknown databases.
      */
     protected function verifyExistingDatabaseBelongsToCompany(Company $company, string $dbName, bool $isRetry): void
     {
         $dbPdo = $this->getDatabaseAdminPdo($dbName);
 
-        // Check if tenant_identity table exists
+        // 1. Check if tenant_identity table exists
         $stmt = $dbPdo->query("SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'tenant_identity'");
-        if (! $stmt || ! $stmt->fetchColumn()) {
-            if ($isRetry) {
-                // In retry, table might not have been created yet, allow continuing
-                return;
+        $identityTableExists = $stmt && (bool) $stmt->fetchColumn();
+
+        if ($identityTableExists) {
+            $stmt = $dbPdo->query('SELECT company_id FROM tenant_identity LIMIT 1');
+            $existingId = $stmt ? $stmt->fetchColumn() : false;
+
+            if ($existingId !== false && (int) $existingId !== (int) $company->id) {
+                throw new ProvisioningException("La base de datos [{$dbName}] ya existe pero pertenece a otra empresa (ID: {$existingId}). No se adoptará ni se eliminará.");
             }
 
-            throw new ProvisioningException("La base de datos [{$dbName}] ya existe pero no contiene identificación técnica válida.");
+            return;
         }
 
-        $stmt = $dbPdo->query('SELECT company_id FROM tenant_identity LIMIT 1');
-        $existingId = $stmt ? $stmt->fetchColumn() : false;
+        // 2. Early failure scenario: tenant_identity does NOT exist yet.
+        // Check provenance: Has this platform recorded any provisioning attempt for this company?
+        $hasPriorAttempt = ProvisioningLog::where('company_id', $company->id)->exists();
 
-        if ($existingId !== false && (int) $existingId !== (int) $company->id) {
-            throw new ProvisioningException("La base de datos [{$dbName}] ya existe pero pertenece a otra empresa (ID: {$existingId}).");
+        // Check if another company's connection references this database
+        $conflictingConnection = CompanyDatabaseConnection::where('database', $dbName)
+            ->where('company_id', '!=', $company->id)
+            ->first();
+
+        if ($conflictingConnection) {
+            throw new ProvisioningException("La base de datos [{$dbName}] ya está asignada a otra empresa registrada (ID: {$conflictingConnection->company_id}).");
         }
+
+        if ($isRetry && $hasPriorAttempt) {
+            // Provenance confirmed: created during an earlier interrupted attempt of this company
+            return;
+        }
+
+        // Alien or unrecorded database: do NOT adopt, do NOT drop
+        throw new ProvisioningException("La base de datos [{$dbName}] ya existe en el servidor pero no fue creada por un proceso registrado para esta empresa. Por seguridad, no se adoptará ni se eliminará.");
     }
 
     /**
@@ -372,9 +484,10 @@ class TenantProvisioningService
     }
 
     /**
-     * Seed or verify the internal tenant identity inside the commercial database.
+     * Seed and protect the internal tenant identity inside the commercial database.
+     * Enforces that application credentials can only SELECT, never mutate or delete it.
      */
-    protected function seedTenantIdentity(string $connectionName, Company $company): void
+    protected function seedTenantIdentity(string $connectionName, Company $company, string $dbName, string $appUsername): void
     {
         $conn = DB::connection($connectionName);
 
@@ -388,6 +501,11 @@ class TenantProvisioningService
                 'updated_at' => now(),
             ]
         );
+
+        // Security boundary: Application credentials can SELECT, but CANNOT INSERT, UPDATE, DELETE or TRUNCATE tenant_identity
+        $dbPdo = $this->getDatabaseAdminPdo($dbName);
+        $dbPdo->exec(sprintf('REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON TABLE tenant_identity FROM "%s"', $appUsername));
+        $dbPdo->exec(sprintf('GRANT SELECT ON TABLE tenant_identity TO "%s"', $appUsername));
     }
 
     /**
@@ -403,18 +521,73 @@ class TenantProvisioningService
             throw new ProvisioningException('Fallo de verificación: No se pudo verificar la identidad empresarial en la base de datos comercial.');
         }
 
-        // 2. DDL Restriction check (Least privilege enforcement: App user MUST NOT be able to create tables)
+        // 2. Identity Immutability check: App user CANNOT UPDATE tenant_identity
         try {
-            $conn->statement('CREATE TABLE __probe_security_test (id INT)');
-            // If it succeeds, drop it and throw security exception
-            $conn->statement('DROP TABLE IF EXISTS __probe_security_test');
-            throw new ProvisioningException('Violación de seguridad: El usuario de aplicación posee privilegios DDL no autorizados.');
+            $conn->table('tenant_identity')->where('company_id', $company->id)->update(['tax_id' => 'tamper_attempt']);
+            throw new ProvisioningException('Violación de seguridad: El usuario de aplicación pudo modificar la identidad técnica (tenant_identity).');
         } catch (QueryException $e) {
-            // Expected: permission denied for schema public
             $msg = strtolower($e->getMessage());
             if (! str_contains($msg, 'permission denied') && ! str_contains($msg, 'permiso denegado')) {
                 throw $e;
             }
+        }
+
+        // 3. Identity Immutability check: App user CANNOT DELETE tenant_identity
+        try {
+            $conn->table('tenant_identity')->where('company_id', $company->id)->delete();
+            throw new ProvisioningException('Violación de seguridad: El usuario de aplicación pudo eliminar la identidad técnica (tenant_identity).');
+        } catch (QueryException $e) {
+            $msg = strtolower($e->getMessage());
+            if (! str_contains($msg, 'permission denied') && ! str_contains($msg, 'permiso denegado')) {
+                throw $e;
+            }
+        }
+
+        // 4. DDL Restriction check (Least privilege enforcement: App user MUST NOT be able to create tables)
+        try {
+            $conn->statement('CREATE TABLE __probe_security_test (id INT)');
+            $conn->statement('DROP TABLE IF EXISTS __probe_security_test');
+            throw new ProvisioningException('Violación de seguridad: El usuario de aplicación posee privilegios DDL no autorizados.');
+        } catch (QueryException $e) {
+            $msg = strtolower($e->getMessage());
+            if (! str_contains($msg, 'permission denied') && ! str_contains($msg, 'permiso denegado')) {
+                throw $e;
+            }
+        }
+    }
+
+    /**
+     * Restrict discretionary access control (DAC) on the project's central database in PostgreSQL.
+     * Revokes CONNECT from PUBLIC so that tenant application roles cannot access central data,
+     * limiting database engine permissions strictly to the central application user and superusers.
+     */
+    public function restrictCentralDatabasePublicAccess(): void
+    {
+        $centralDb = (string) config('database.connections.central.database');
+        $centralUser = (string) config('database.connections.central.username', 'postgres');
+
+        if (empty($centralDb)) {
+            return;
+        }
+
+        $this->assertValidIdentifier($centralDb);
+
+        $adminPdo = $this->getAdminPdo();
+
+        // Check if the central database exists on this server
+        $stmt = $adminPdo->prepare('SELECT 1 FROM pg_database WHERE datname = :dbname');
+        $stmt->execute(['dbname' => $centralDb]);
+        if (! $stmt->fetchColumn()) {
+            return;
+        }
+
+        // Revoke CONNECT from PUBLIC on the project-managed central database (DAC enforcement)
+        $adminPdo->exec(sprintf('REVOKE CONNECT ON DATABASE "%s" FROM PUBLIC', $centralDb));
+
+        // Ensure the central application role retains CONNECT
+        if (! empty($centralUser)) {
+            $this->assertValidIdentifier($centralUser);
+            $adminPdo->exec(sprintf('GRANT CONNECT ON DATABASE "%s" TO "%s"', $centralDb, $centralUser));
         }
     }
 
