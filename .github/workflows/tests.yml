@@ -45,8 +45,6 @@ jobs:
 
       - name: Setup PNPM
         uses: pnpm/action-setup@v4
-        with:
-          version: 9
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -58,7 +56,10 @@ jobs:
         run: |
           php -r '
             $pdo = new PDO("pgsql:host=127.0.0.1;port=5434;dbname=core_rec_technology", "postgres", "secretpassword");
-            $pdo->exec("CREATE DATABASE core_rec_testing;");
+            $exists = $pdo->query("SELECT 1 FROM pg_database WHERE datname = \"core_rec_testing\"")->fetchColumn();
+            if (! $exists) {
+                $pdo->exec("CREATE DATABASE core_rec_testing;");
+            }
           '
 
       - name: Setup Application
