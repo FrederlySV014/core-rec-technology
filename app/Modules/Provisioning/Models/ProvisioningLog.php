@@ -8,7 +8,19 @@ use App\Modules\Provisioning\Enums\ProvisioningStage;
 use App\Modules\Provisioning\Enums\ProvisioningStatus;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Support\Carbon;
 
+/**
+ * @property int $id
+ * @property int $company_id
+ * @property ProvisioningStage $stage
+ * @property ProvisioningStatus $status
+ * @property array<string, mixed>|null $details
+ * @property string|null $error_message
+ * @property int|null $executed_by_user_id
+ * @property Carbon|null $started_at
+ * @property Carbon|null $finished_at
+ */
 class ProvisioningLog extends Model
 {
     /**

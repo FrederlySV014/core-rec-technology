@@ -4,6 +4,7 @@ use App\Http\Controllers\Auth\CompanyInvitationController;
 use App\Http\Controllers\Company\CompanyMemberController;
 use App\Http\Controllers\Company\CompanyOwnershipTransferController;
 use App\Http\Controllers\Company\CompanyRoleController;
+use App\Http\Controllers\Platform\PlatformProvisioningController;
 use App\Http\Controllers\Platform\PlatformStaffController;
 use App\Models\User;
 use App\Modules\Access\DTOs\CompanyContext;
@@ -113,6 +114,18 @@ Route::middleware(['auth', 'verified'])->group(function () {
         Route::get('audit', [PlatformStaffController::class, 'audit'])
             ->middleware('platform.can:platform.audit.view')
             ->name('platform.audit.index');
+
+        Route::get('companies/{company}/provisioning', [PlatformProvisioningController::class, 'status'])
+            ->middleware('platform.can:platform.provisioning.view')
+            ->name('platform.provisioning.status');
+
+        Route::post('companies/{company}/provision', [PlatformProvisioningController::class, 'provision'])
+            ->middleware('platform.can:platform.provisioning.manage')
+            ->name('platform.provisioning.store');
+
+        Route::post('companies/{company}/provision/retry', [PlatformProvisioningController::class, 'retry'])
+            ->middleware('platform.can:platform.provisioning.retry')
+            ->name('platform.provisioning.retry');
     });
 
     // Commercial Context Routes: /app/{company:slug}
