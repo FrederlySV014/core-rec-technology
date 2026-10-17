@@ -38,9 +38,16 @@ export default function Workspace({
                             Slug: {company.slug}
                         </p>
                     </div>
-                    <Button variant="outline" asChild>
-                        <Link href={dashboard()}>Cambiar de empresa</Link>
-                    </Button>
+                    <div className="flex items-center gap-2">
+                        <Button variant="default" asChild>
+                            <Link href={`/app/${company.slug}/catalog`}>
+                                Catálogo Comercial
+                            </Link>
+                        </Button>
+                        <Button variant="outline" asChild>
+                            <Link href={dashboard()}>Cambiar de empresa</Link>
+                        </Button>
+                    </div>
                 </div>
 
                 {license.is_read_only && (

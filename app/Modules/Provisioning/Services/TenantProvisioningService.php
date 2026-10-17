@@ -33,6 +33,11 @@ class TenantProvisioningService
      * @throws ProvisioningException
      */
     /**
+     * Dedicated PDO session holding the exclusive operation-level advisory lock.
+     */
+    protected ?PDO $operationLockPdo = null;
+
+    /**
      * Provision an independent commercial database for a company.
      *
      * @param  Company  $company  The company to provision.
@@ -49,21 +54,31 @@ class TenantProvisioningService
         bool $isRetry = false,
         bool $force = false
     ): CompanyDatabaseConnection {
-        // 1. Atomic pre-condition verification and pessimistic row lock acquisition
-        $this->acquireProvisioningLock($company, $isRetry, $force);
-
-        $startedAt = now();
-
-        $this->audit($company, $actor, 'tenant.provisioning_started', [
-            'is_retry' => $isRetry,
-            'company_id' => $company->id,
-            'forced' => $force,
-        ]);
-
-        $stage = ProvisioningStage::CreateDatabase;
-        $details = [];
+        // 1. Acquire exclusive operation-level advisory lock across PostgreSQL cluster
+        // (Guarantees zero overlap across processes, even under --force or stale timeout)
+        $this->acquireOperationLock($company);
 
         try {
+            // 2. Atomic pre-condition verification and pessimistic row lock acquisition
+            $this->acquireProvisioningLock($company, $isRetry, $force);
+        } catch (Throwable $e) {
+            $this->releaseOperationLock($company);
+
+            throw $e;
+        }
+
+        $startedAt = now();
+        $stage = ProvisioningStage::CreateDatabase;
+
+        try {
+            $this->audit($company, $actor, 'tenant.provisioning_started', [
+                'is_retry' => $isRetry,
+                'company_id' => $company->id,
+                'forced' => $force,
+            ]);
+
+            $details = [];
+
             // Derive stable technical names
             $dbName = $this->deriveDatabaseName($company);
             $migUsername = $this->deriveMigrationUsername($company);
@@ -102,9 +117,10 @@ class TenantProvisioningService
                 ]);
             }
 
-            // STAGE 1: Create Database & Technical Users in PostgreSQL
+            // STAGE 1: Create Database & Technical Users in PostgreSQL with Provenance Token
             $stage = ProvisioningStage::CreateDatabase;
             $stageStart = now();
+            $creationToken = Str::uuid()->toString();
 
             $this->createDatabaseAndRoles(
                 company: $company,
@@ -113,13 +129,15 @@ class TenantProvisioningService
                 migPassword: $migPassword,
                 appUsername: $appUsername,
                 appPassword: $appPassword,
-                isRetry: $isRetry
+                isRetry: $isRetry,
+                creationToken: $creationToken
             );
 
             $this->recordLog($company, $stage, ProvisioningStatus::Ready, [
                 'database' => $dbName,
                 'mig_user' => $migUsername,
                 'app_user' => $appUsername,
+                'provenance_token' => $creationToken,
             ], null, $actor, $stageStart);
 
             // STAGE 2: Run Exclusively Commercial (Tenant) Migrations
@@ -217,6 +235,7 @@ class TenantProvisioningService
             );
         } finally {
             $this->cleanupDynamicConnections();
+            $this->releaseOperationLock($company);
         }
     }
 
@@ -346,7 +365,8 @@ class TenantProvisioningService
         string $migPassword,
         string $appUsername,
         string $appPassword,
-        bool $isRetry
+        bool $isRetry,
+        ?string $creationToken = null
     ): void {
         // Enforce DAC connection isolation on the project-managed central database
         $this->restrictCentralDatabasePublicAccess();
@@ -364,6 +384,15 @@ class TenantProvisioningService
         } else {
             // In PostgreSQL, CREATE DATABASE cannot execute inside a transaction block.
             $pdo->exec(sprintf('CREATE DATABASE "%s" WITH ENCODING %s', $dbName, $pdo->quote('UTF8')));
+
+            // Stamp immutable creation provenance token in PostgreSQL catalog
+            if ($creationToken) {
+                $pdo->exec(sprintf(
+                    'COMMENT ON DATABASE "%s" IS %s',
+                    $dbName,
+                    $pdo->quote("rec_provenance:company_{$company->id}:{$creationToken}")
+                ));
+            }
         }
 
         // 2. Discretionary Access Control (DAC): Revoke public connect privilege on this tenant database
@@ -402,33 +431,17 @@ class TenantProvisioningService
         // Grant USAGE (lookup) rights to app user (no CREATE, no DDL!)
         $dbPdo->exec(sprintf('GRANT USAGE ON SCHEMA public TO "%s"', $appUsername));
 
-        // Default privileges: any future table/sequence created by migUsername is readable/writable by appUsername
-        $dbPdo->exec(sprintf(
-            'ALTER DEFAULT PRIVILEGES FOR ROLE "%s" IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO "%s"',
-            $migUsername,
-            $appUsername
-        ));
-        $dbPdo->exec(sprintf(
-            'ALTER DEFAULT PRIVILEGES FOR ROLE "%s" IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO "%s"',
-            $migUsername,
-            $appUsername
-        ));
+        // Revoke any default privileges on all tables/sequences so non-ERP tables are never exposed to the app role
+        $dbPdo->exec(sprintf('ALTER DEFAULT PRIVILEGES FOR ROLE "%s" IN SCHEMA public REVOKE ALL ON TABLES FROM "%s"', $migUsername, $appUsername));
+        $dbPdo->exec(sprintf('ALTER DEFAULT PRIVILEGES FOR ROLE "%s" IN SCHEMA public REVOKE ALL ON SEQUENCES FROM "%s"', $migUsername, $appUsername));
 
-        // If tables already exist (retry scenario), grant permissions to appUsername
-        $dbPdo->exec(sprintf('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO "%s"', $appUsername));
-        $dbPdo->exec(sprintf('GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO "%s"', $appUsername));
-
-        // Always re-enforce that tenant_identity table is strictly read-only for appUsername if it exists
-        $stmtIdentity = $dbPdo->query("SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'tenant_identity'");
-        if ($stmtIdentity && $stmtIdentity->fetchColumn()) {
-            $dbPdo->exec(sprintf('REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON TABLE tenant_identity FROM "%s"', $appUsername));
-            $dbPdo->exec(sprintf('GRANT SELECT ON TABLE tenant_identity TO "%s"', $appUsername));
-        }
+        // Grant privileges ONLY on ERP-managed tables and sequences (categories, units_of_measure, products)
+        $this->grantErpPrivileges($dbPdo, $appUsername);
     }
 
     /**
      * Verify an existing database belongs to the company, or throw if mismatched/unknown.
-     * Uses platform provenance to recognize interrupted creations without adopting unknown databases.
+     * Uses concrete PostgreSQL catalog provenance to recognize interrupted creations without adopting unknown databases.
      */
     protected function verifyExistingDatabaseBelongsToCompany(Company $company, string $dbName, bool $isRetry): void
     {
@@ -450,8 +463,28 @@ class TenantProvisioningService
         }
 
         // 2. Early failure scenario: tenant_identity does NOT exist yet.
-        // Check provenance: Has this platform recorded any provisioning attempt for this company?
-        $hasPriorAttempt = ProvisioningLog::where('company_id', $company->id)->exists();
+        // Inspect concrete database-level provenance token in PostgreSQL catalog
+        $adminPdo = $this->getAdminPdo();
+        $stmtDesc = $adminPdo->prepare("SELECT pg_catalog.shobj_description(d.oid, 'pg_database') FROM pg_catalog.pg_database d WHERE d.datname = :dbname");
+        $stmtDesc->execute(['dbname' => $dbName]);
+        $databaseComment = (string) $stmtDesc->fetchColumn();
+
+        $expectedPrefix = "rec_provenance:company_{$company->id}:";
+        if (str_starts_with($databaseComment, $expectedPrefix)) {
+            $token = substr($databaseComment, strlen($expectedPrefix));
+
+            // Verify central evidence: was this token recorded in a successful CreateDatabase stage by our platform?
+            $hasVerifiedCreationLog = ProvisioningLog::where('company_id', $company->id)
+                ->where('stage', ProvisioningStage::CreateDatabase)
+                ->where('status', ProvisioningStatus::Ready)
+                ->whereJsonContains('details->provenance_token', $token)
+                ->exists();
+
+            if ($isRetry && $hasVerifiedCreationLog) {
+                // Provenance concretely verified: this exact physical database was created by the platform
+                return;
+            }
+        }
 
         // Check if another company's connection references this database
         $conflictingConnection = CompanyDatabaseConnection::where('database', $dbName)
@@ -462,13 +495,77 @@ class TenantProvisioningService
             throw new ProvisioningException("La base de datos [{$dbName}] ya está asignada a otra empresa registrada (ID: {$conflictingConnection->company_id}).");
         }
 
-        if ($isRetry && $hasPriorAttempt) {
-            // Provenance confirmed: created during an earlier interrupted attempt of this company
+        // Alien database, or database without verifiable creation evidence:
+        // Conserve the resource intact, do not adopt, do not drop, require manual reconciliation
+        throw new ProvisioningException("La base de datos [{$dbName}] ya existe pero no cuenta con evidencia comprobable de procedencia (sin tenant_identity ni token de creación verificado). Por seguridad, se conserva el recurso intacto y se requiere conciliación explícita del administrador.");
+    }
+
+    /**
+     * Acquire an operation-level PostgreSQL advisory lock covering the entire provisioning execution.
+     * Guarantees zero concurrent or overlapping executions across workers and CLI, even with --force.
+     *
+     * @throws ProvisioningException
+     */
+    public function acquireOperationLock(Company $company): void
+    {
+        if ($this->operationLockPdo !== null) {
             return;
         }
 
-        // Alien or unrecorded database: do NOT adopt, do NOT drop
-        throw new ProvisioningException("La base de datos [{$dbName}] ya existe en el servidor pero no fue creada por un proceso registrado para esta empresa. Por seguridad, no se adoptará ni se eliminará.");
+        $centralConfig = DB::connection('central')->getConfig();
+        $dsn = sprintf(
+            'pgsql:host=%s;port=%d;dbname=%s',
+            $centralConfig['host'],
+            $centralConfig['port'],
+            $centralConfig['database']
+        );
+
+        $pdo = new PDO(
+            $dsn,
+            (string) $centralConfig['username'],
+            (string) $centralConfig['password'],
+            [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]
+        );
+
+        $lockKey = $this->deriveAdvisoryLockKey($company);
+
+        $stmt = $pdo->prepare('SELECT pg_try_advisory_lock(:lock_key)');
+        $stmt->execute(['lock_key' => $lockKey]);
+        $acquired = (bool) $stmt->fetchColumn();
+
+        if (! $acquired) {
+            throw new ProvisioningException('Existe un proceso de aprovisionamiento activo en ejecución para esta empresa (bloqueo exclusivo de operación en PostgreSQL). No se permite una ejecución simultánea ni solapada, incluso con --force.');
+        }
+
+        $this->operationLockPdo = $pdo;
+    }
+
+    /**
+     * Release the operation-level PostgreSQL advisory lock and close the session.
+     */
+    public function releaseOperationLock(Company $company): void
+    {
+        if ($this->operationLockPdo === null) {
+            return;
+        }
+
+        try {
+            $lockKey = $this->deriveAdvisoryLockKey($company);
+            $stmt = $this->operationLockPdo->prepare('SELECT pg_advisory_unlock(:lock_key)');
+            $stmt->execute(['lock_key' => $lockKey]);
+        } catch (Throwable) {
+            // Ignore unlock errors during teardown
+        } finally {
+            $this->operationLockPdo = null;
+        }
+    }
+
+    /**
+     * Derive a deterministic integer key for PostgreSQL advisory locking per company.
+     */
+    public function deriveAdvisoryLockKey(Company $company): int
+    {
+        return (int) sprintf('%u', crc32("rec_tenant_provisioning_{$company->id}"));
     }
 
     /**
@@ -502,10 +599,9 @@ class TenantProvisioningService
             ]
         );
 
-        // Security boundary: Application credentials can SELECT, but CANNOT INSERT, UPDATE, DELETE or TRUNCATE tenant_identity
+        // Enforce ERP table privileges and identity immutability
         $dbPdo = $this->getDatabaseAdminPdo($dbName);
-        $dbPdo->exec(sprintf('REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON TABLE tenant_identity FROM "%s"', $appUsername));
-        $dbPdo->exec(sprintf('GRANT SELECT ON TABLE tenant_identity TO "%s"', $appUsername));
+        $this->grantErpPrivileges($dbPdo, $appUsername);
     }
 
     /**
@@ -702,9 +798,49 @@ class TenantProvisioningService
     }
 
     /**
+     * Grant privileges strictly limited to ERP-managed tables and sequences.
+     * Prevents privilege leakage to non-ERP tables (e.g. stores, integrations) sharing the database.
+     */
+    public function grantErpPrivileges(PDO $dbPdo, string $appUsername): void
+    {
+        $erpTables = ['categories', 'units_of_measure', 'products'];
+
+        foreach ($erpTables as $table) {
+            $stmt = $dbPdo->prepare("SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = :tbl");
+            $stmt->execute(['tbl' => $table]);
+            if ($stmt->fetchColumn()) {
+                $dbPdo->exec(sprintf('GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE "%s" TO "%s"', $table, $appUsername));
+
+                // Find sequences specifically bound to this ERP table
+                $seqStmt = $dbPdo->prepare("
+                    SELECT s.relname AS seqname
+                    FROM pg_class s
+                    JOIN pg_depend d ON d.objid = s.oid
+                    JOIN pg_class t ON d.refobjid = t.oid
+                    JOIN pg_namespace n ON n.oid = s.relnamespace
+                    WHERE s.relkind = 'S' AND n.nspname = 'public' AND t.relname = :tbl
+                ");
+                $seqStmt->execute(['tbl' => $table]);
+                $sequences = $seqStmt->fetchAll(PDO::FETCH_COLUMN);
+
+                foreach ($sequences as $seq) {
+                    $dbPdo->exec(sprintf('GRANT USAGE, SELECT, UPDATE ON SEQUENCE "%s" TO "%s"', $seq, $appUsername));
+                }
+            }
+        }
+
+        // Always re-enforce that tenant_identity table is strictly read-only for appUsername if it exists
+        $stmtIdentity = $dbPdo->query("SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'tenant_identity'");
+        if ($stmtIdentity && $stmtIdentity->fetchColumn()) {
+            $dbPdo->exec(sprintf('REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON TABLE tenant_identity FROM "%s"', $appUsername));
+            $dbPdo->exec(sprintf('GRANT SELECT ON TABLE tenant_identity TO "%s"', $appUsername));
+        }
+    }
+
+    /**
      * Get PDO connection to a specific tenant database as provisioner.
      */
-    protected function getDatabaseAdminPdo(string $dbName): PDO
+    public function getDatabaseAdminPdo(string $dbName): PDO
     {
         $host = config('tenancy.provisioner.host', '127.0.0.1');
         $port = config('tenancy.provisioner.port', 5432);

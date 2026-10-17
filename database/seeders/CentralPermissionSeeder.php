@@ -88,7 +88,9 @@ class CentralPermissionSeeder extends Seeder
             // inventory
             'inventory' => [
                 ['slug' => 'inventory.products.view', 'name' => 'Ver Catálogo de Productos', 'description' => 'Listar productos, variantes y precios.'],
-                ['slug' => 'inventory.products.manage', 'name' => 'Administrar Productos', 'description' => 'Crear, editar y deshabilitar productos y categorías.'],
+                ['slug' => 'inventory.products.manage', 'name' => 'Administrar Productos', 'description' => 'Crear, editar y activar o desactivar productos.'],
+                ['slug' => 'inventory.categories.manage', 'name' => 'Administrar Categorías', 'description' => 'Crear, editar y activar o desactivar categorías de productos.'],
+                ['slug' => 'inventory.units.manage', 'name' => 'Administrar Unidades de Medida', 'description' => 'Crear, editar y activar o desactivar unidades de medida.'],
                 ['slug' => 'inventory.stock.view', 'name' => 'Ver Stock', 'description' => 'Consultar existencias y almacenes.'],
                 ['slug' => 'inventory.stock.adjust', 'name' => 'Ajustar Inventario', 'description' => 'Registrar entradas, salidas y transferencias de inventario.'],
             ],

@@ -115,7 +115,7 @@ describe('Tenant Commercial Database Provisioning (Phase 5)', function () {
         DB::purge('test_tenant_tables');
 
         $tables = DB::connection('test_tenant_tables')
-            ->select("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'");
+            ->select("SELECT tablename AS table_name FROM pg_tables WHERE schemaname = 'public'");
 
         $tableNames = array_map(fn ($row) => $row->table_name, $tables);
 
@@ -308,114 +308,179 @@ describe('Tenant Commercial Database Provisioning (Phase 5)', function () {
         DB::purge('test_central_secondary');
     });
 
-    test('9. early failure recovery recognizes safe provenance and rejects unknown alien databases', function () use (&$cleanupCompanies) {
+    test('9. alien database without tenant_identity is rejected across initial attempt and retry, remaining intact', function () use (&$cleanupCompanies) {
         $service = app(TenantProvisioningService::class);
-
-        // Case A: Early failure with valid platform provenance
-        $companyA = createTestCompany('early-fail', $cleanupCompanies);
-        $dbNameA = $service->deriveDatabaseName($companyA);
+        $company = createTestCompany('alien-prov', $cleanupCompanies);
+        $dbName = $service->deriveDatabaseName($company);
 
         $adminPdoMethod = new ReflectionMethod($service, 'getAdminPdo');
         $adminPdoMethod->setAccessible(true);
         /** @var PDO $pdo */
         $pdo = $adminPdoMethod->invoke($service);
 
-        // Terminate existing connections and recreate empty database (without tenant_identity)
-        $pdo->exec(sprintf("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '%s' AND pid <> pg_backend_pid()", $dbNameA));
-        $pdo->exec(sprintf('DROP DATABASE IF EXISTS "%s"', $dbNameA));
-        $pdo->exec(sprintf('CREATE DATABASE "%s" WITH ENCODING %s', $dbNameA, $pdo->quote('UTF8')));
+        // Pre-create alien database in PostgreSQL without provenance comment and without tenant_identity
+        $pdo->exec(sprintf("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '%s' AND pid <> pg_backend_pid()", $dbName));
+        $pdo->exec(sprintf('DROP DATABASE IF EXISTS "%s"', $dbName));
+        $pdo->exec(sprintf('CREATE DATABASE "%s" WITH ENCODING %s', $dbName, $pdo->quote('UTF8')));
 
-        // Record prior provisioning log (provenance)
-        ProvisioningLog::create([
-            'company_id' => $companyA->id,
-            'stage' => ProvisioningStage::CreateDatabase,
-            'status' => ProvisioningStatus::Failed,
-            'started_at' => now()->subMinutes(5),
-            'finished_at' => now()->subMinutes(5),
-            'error_message' => 'Simulated crash right after database creation',
-        ]);
+        // Populate foreign payload inside the alien database to verify it remains 100% intact
+        $dbAdminMethod = new ReflectionMethod($service, 'getDatabaseAdminPdo');
+        $dbAdminMethod->setAccessible(true);
+        /** @var PDO $dbPdo */
+        $dbPdo = $dbAdminMethod->invoke($service, $dbName);
+        $dbPdo->exec('CREATE TABLE alien_foreign_data (id serial primary key, note text)');
+        $dbPdo->exec("INSERT INTO alien_foreign_data (note) VALUES ('unrelated third party payload')");
 
-        // Retrying must safely recognize the resource created by that attempt and complete provisioning
-        $connA = $service->retry($companyA);
+        // 1. Initial provisioning attempt: MUST reject the alien database and record failure
+        $firstAttemptFailed = false;
+        try {
+            $service->provision($company);
+        } catch (ProvisioningException $e) {
+            $firstAttemptFailed = true;
+            expect($e->getMessage())->toContain('no cuenta con evidencia comprobable de procedencia')
+                ->and($e->getMessage())->toContain('conciliación explícita');
+        }
+        expect($firstAttemptFailed)->toBeTrue();
 
-        expect($connA)->toBeInstanceOf(CompanyDatabaseConnection::class)
-            ->and($companyA->fresh()->technical_provisioning_status)->toBe(ProvisioningStatus::Ready)
-            ->and($connA->database)->toBe($dbNameA);
+        // Verify state after first attempt:
+        // - Company marked Failed
+        // - ProvisioningLog recorded with Failed status
+        // - Connection configuration was saved/pre-persisted
+        expect($company->fresh()->technical_provisioning_status)->toBe(ProvisioningStatus::Failed);
+        $failedLog = ProvisioningLog::where('company_id', $company->id)
+            ->where('stage', ProvisioningStage::CreateDatabase)
+            ->where('status', ProvisioningStatus::Failed)
+            ->first();
+        expect($failedLog)->not->toBeNull();
+        expect($company->fresh()->databaseConnection)->not->toBeNull();
 
-        // Case B: Alien database without provenance
-        $companyB = createTestCompany('alien-db', $cleanupCompanies);
-        $dbNameB = $service->deriveDatabaseName($companyB);
+        // 2. Second provisioning attempt with --retry:
+        // Even though a provisioning_log exists and connection credentials were saved,
+        // it MUST STILL BE REJECTED because attempts != concrete creation evidence.
+        $secondAttemptFailed = false;
+        try {
+            $service->retry($company);
+        } catch (ProvisioningException $e) {
+            $secondAttemptFailed = true;
+            expect($e->getMessage())->toContain('no cuenta con evidencia comprobable de procedencia')
+                ->and($e->getMessage())->toContain('conciliación explícita');
+        }
+        expect($secondAttemptFailed)->toBeTrue();
 
-        $pdo->exec(sprintf("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '%s' AND pid <> pg_backend_pid()", $dbNameB));
-        $pdo->exec(sprintf('DROP DATABASE IF EXISTS "%s"', $dbNameB));
-        $pdo->exec(sprintf('CREATE DATABASE "%s" WITH ENCODING %s', $dbNameB, $pdo->quote('UTF8')));
-
-        // Ensure NO provisioning logs exist for company B
-        ProvisioningLog::where('company_id', $companyB->id)->delete();
-
-        // Attempting to provision or retry must REJECT without adopting and without deleting
-        expect(fn () => $service->provision($companyB))
-            ->toThrow(ProvisioningException::class, 'no fue creada por un proceso registrado para esta empresa');
-
-        // Verify the alien database was NOT deleted
+        // 3. Verify alien database remained completely intact (not deleted, data unmodified)
         $stmt = $pdo->prepare('SELECT 1 FROM pg_database WHERE datname = :dbname');
-        $stmt->execute(['dbname' => $dbNameB]);
+        $stmt->execute(['dbname' => $dbName]);
         expect((bool) $stmt->fetchColumn())->toBeTrue();
 
-        // Clean up alien database
-        $pdo->exec(sprintf('DROP DATABASE IF EXISTS "%s"', $dbNameB));
+        $stmtData = $dbPdo->query('SELECT note FROM alien_foreign_data LIMIT 1');
+        expect($stmtData->fetchColumn())->toBe('unrelated third party payload');
+
+        // Cleanup alien database
+        $pdo->exec(sprintf("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '%s' AND pid <> pg_backend_pid()", $dbName));
+        $pdo->exec(sprintf('DROP DATABASE IF EXISTS "%s"', $dbName));
+
+        // 4. Contrast with legitimate platform-created resource early failure:
+        // Verifiable creation evidence (token in PostgreSQL catalog matching central Ready log)
+        $companySafe = createTestCompany('proven-safe', $cleanupCompanies);
+        $dbNameSafe = $service->deriveDatabaseName($companySafe);
+
+        $pdo->exec(sprintf("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '%s' AND pid <> pg_backend_pid()", $dbNameSafe));
+        $pdo->exec(sprintf('DROP DATABASE IF EXISTS "%s"', $dbNameSafe));
+        $pdo->exec(sprintf('CREATE DATABASE "%s" WITH ENCODING %s', $dbNameSafe, $pdo->quote('UTF8')));
+
+        $safeToken = Str::uuid()->toString();
+        $pdo->exec(sprintf(
+            'COMMENT ON DATABASE "%s" IS %s',
+            $dbNameSafe,
+            $pdo->quote("rec_provenance:company_{$companySafe->id}:{$safeToken}")
+        ));
+
+        ProvisioningLog::create([
+            'company_id' => $companySafe->id,
+            'stage' => ProvisioningStage::CreateDatabase,
+            'status' => ProvisioningStatus::Ready,
+            'started_at' => now()->subMinutes(3),
+            'finished_at' => now()->subMinutes(3),
+            'details' => ['provenance_token' => $safeToken],
+        ]);
+
+        // Retrying now safely recognizes the platform-created resource and completes provisioning
+        $connSafe = $service->retry($companySafe);
+        expect($connSafe)->toBeInstanceOf(CompanyDatabaseConnection::class)
+            ->and($companySafe->fresh()->technical_provisioning_status)->toBe(ProvisioningStatus::Ready)
+            ->and($connSafe->database)->toBe($dbNameSafe);
     });
 
-    test('10. abandoned in-progress execution recovery respects stale timeout and active lock', function () use (&$cleanupCompanies) {
+    test('10. whole-operation exclusion blocks concurrent retry and force while process is active, permitting recovery only after termination', function () use (&$cleanupCompanies) {
         $service = app(TenantProvisioningService::class);
-        $company = createTestCompany('abandoned', $cleanupCompanies);
+        $company = createTestCompany('excl-proc', $cleanupCompanies);
 
-        // Subcase A: Active execution (e.g. started 2 minutes ago)
+        $centralConfig = DB::connection('central')->getConfig();
+        $lockKey = $service->deriveAdvisoryLockKey($company);
+
+        // Spawn Process 1 as an independent OS process that acquires the PostgreSQL advisory lock
+        $phpCode = sprintf(
+            '$pdo = new PDO("pgsql:host=%s;port=%d;dbname=%s", "%s", "%s", [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]); '.
+            '$stmt = $pdo->prepare("SELECT pg_try_advisory_lock(%d)"); '.
+            '$stmt->execute(); '.
+            '$locked = (bool) $stmt->fetchColumn(); '.
+            'if ($locked) { echo "LOCKED\n"; flush(); } else { echo "LOCK_FAILED\n"; flush(); } '.
+            'sleep(30);',
+            $centralConfig['host'],
+            $centralConfig['port'],
+            $centralConfig['database'],
+            $centralConfig['username'],
+            $centralConfig['password'],
+            $lockKey
+        );
+
+        $descriptors = [
+            0 => ['pipe', 'r'],
+            1 => ['pipe', 'w'],
+            2 => ['pipe', 'w'],
+        ];
+
+        $proc1 = proc_open([PHP_BINARY, '-r', $phpCode], $descriptors, $pipes);
+        expect(is_resource($proc1))->toBeTrue();
+
+        // Wait until Process 1 confirms it acquired the advisory lock
+        $statusLine = trim(fgets($pipes[1]));
+        expect($statusLine)->toBe('LOCKED');
+
+        // Simulate that Process 1 has been in progress beyond the stale threshold (e.g. 25 minutes ago > 15 min threshold)
         $company->update(['technical_provisioning_status' => ProvisioningStatus::InProgress]);
         ProvisioningLog::create([
             'company_id' => $company->id,
             'stage' => ProvisioningStage::CreateDatabase,
             'status' => ProvisioningStatus::InProgress,
-            'started_at' => now()->subMinutes(2),
+            'started_at' => now()->subMinutes(25),
         ]);
 
-        // A second normal attempt or retry must be BLOCKED while active
-        expect(fn () => $service->provision($company))
-            ->toThrow(ProvisioningException::class, 'No se permite una segunda ejecución mientras la primera siga activa');
-
+        // Process 2 (the current test process) attempts to recover:
+        // 1. Attempt recovery via --retry: MUST be blocked because Process 1 is still active
         expect(fn () => $service->retry($company))
-            ->toThrow(ProvisioningException::class, 'No se permite una segunda ejecución mientras la primera siga activa');
+            ->toThrow(ProvisioningException::class, 'bloqueo exclusivo de operación en PostgreSQL');
 
-        // Subcase B: Abandoned execution (started 20 minutes ago, exceeding 15 min stale threshold)
-        ProvisioningLog::where('company_id', $company->id)->delete();
-        ProvisioningLog::create([
-            'company_id' => $company->id,
-            'stage' => ProvisioningStage::CreateDatabase,
-            'status' => ProvisioningStatus::InProgress,
-            'started_at' => now()->subMinutes(20),
-        ]);
+        // 2. Attempt recovery via --force: MUST ALSO be blocked because --force cannot overlap with an active process
+        expect(fn () => $service->retry($company, force: true))
+            ->toThrow(ProvisioningException::class, 'bloqueo exclusivo de operación en PostgreSQL');
 
-        // Normal provision without retry advises operator
-        expect(fn () => $service->provision($company))
-            ->toThrow(ProvisioningException::class, 'parece abandonado');
+        // Neither --retry nor --force could overlap with Process 1 while it was active.
+        // 3. Now, terminate/interrupt Process 1 (simulating crash or worker termination)
+        fclose($pipes[0]);
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        proc_terminate($proc1);
+        proc_close($proc1);
 
-        // Retry recovers safely and finishes as Ready
-        $conn = $service->retry($company);
-        expect($company->fresh()->technical_provisioning_status)->toBe(ProvisioningStatus::Ready);
+        // Small pause to allow OS socket cleanup
+        usleep(100000); // 100ms
 
-        // Subcase C: Operator forced recovery even during active window
-        $company2 = createTestCompany('force-rec', $cleanupCompanies);
-        $company2->update(['technical_provisioning_status' => ProvisioningStatus::InProgress]);
-        ProvisioningLog::create([
-            'company_id' => $company2->id,
-            'stage' => ProvisioningStage::CreateDatabase,
-            'status' => ProvisioningStatus::InProgress,
-            'started_at' => now()->subMinutes(1), // clearly active (< 15 min)
-        ]);
+        // 4. Tras terminar o interrumpir realmente el primer proceso, la recuperación sí es posible
+        $recoveredConn = $service->retry($company, force: true);
 
-        // Forced recovery recovers immediately
-        $conn2 = $service->retry($company2, force: true);
-        expect($company2->fresh()->technical_provisioning_status)->toBe(ProvisioningStatus::Ready);
+        expect($recoveredConn)->toBeInstanceOf(CompanyDatabaseConnection::class)
+            ->and($company->fresh()->technical_provisioning_status)->toBe(ProvisioningStatus::Ready);
     });
 
     test('11. consistent role credentials prevent unnecessary rotations and heal desynchronized PostgreSQL passwords', function () use (&$cleanupCompanies) {

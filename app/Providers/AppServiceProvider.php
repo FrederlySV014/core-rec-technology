@@ -8,6 +8,7 @@ use App\Modules\Access\Services\CompanyAuthorizationService;
 use App\Modules\Access\Services\PlatformAuthorizationService;
 use App\Modules\Audit\Listeners\AuthenticationAuditSubscriber;
 use App\Modules\Companies\Models\Company;
+use App\Modules\Tenancy\Services\TenantConnectionManager;
 use Carbon\CarbonImmutable;
 use Illuminate\Support\Facades\Date;
 use Illuminate\Support\Facades\DB;
@@ -23,7 +24,7 @@ class AppServiceProvider extends ServiceProvider
      */
     public function register(): void
     {
-        //
+        $this->app->singleton(TenantConnectionManager::class);
     }
 
     /**

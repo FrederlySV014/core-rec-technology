@@ -4,6 +4,7 @@ use App\Http\Middleware\AuthorizeCompanyPermission;
 use App\Http\Middleware\AuthorizePlatformPermission;
 use App\Http\Middleware\EnsurePrivilegedUserHasTwoFactorEnabled;
 use App\Http\Middleware\EnsureUserIsActive;
+use App\Http\Middleware\EstablishTenantConnection;
 use App\Http\Middleware\HandleAppearance;
 use App\Http\Middleware\HandleInertiaRequests;
 use App\Http\Middleware\ResolveCompanyContext;
@@ -36,6 +37,7 @@ return Application::configure(basePath: dirname(__DIR__))
             'company.can' => AuthorizeCompanyPermission::class,
             'platform.can' => AuthorizePlatformPermission::class,
             'privileged.2fa' => EnsurePrivilegedUserHasTwoFactorEnabled::class,
+            'tenant.connection' => EstablishTenantConnection::class,
         ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {

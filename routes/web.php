@@ -10,10 +10,16 @@ use App\Models\User;
 use App\Modules\Access\DTOs\CompanyContext;
 use App\Modules\Access\Models\CompanyRole;
 use App\Modules\Access\Services\PlatformAuthorizationService;
+use App\Modules\Catalog\Http\Controllers\CategoryController;
+use App\Modules\Catalog\Http\Controllers\ProductCatalogController;
+use App\Modules\Catalog\Http\Controllers\ProductController;
+use App\Modules\Catalog\Http\Controllers\UnitOfMeasureController;
 use App\Modules\Companies\Enums\CompanyStatus;
 use App\Modules\Identity\Enums\MembershipStatus;
 use App\Modules\Identity\Models\Membership;
 use App\Modules\Licensing\Services\LicenseResolverService;
+use App\Modules\Tenancy\Models\TenantIdentity;
+use App\Modules\Tenancy\Services\TenantConnectionManager;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
 use Inertia\Inertia;
@@ -150,7 +156,82 @@ Route::middleware(['auth', 'verified'])->group(function () {
             ]);
         })->name('company.workspace');
 
-        // Commercial test endpoints to prove authorization enforcement
+        // Commercial Database Routes (require active tenant connection and valid identity)
+        Route::middleware(['tenant.connection'])->group(function () {
+            if (app()->environment('local', 'testing')) {
+                Route::get('diagnostic/tenant-identity', function (TenantConnectionManager $manager) {
+                    /** @var TenantIdentity|null $identity */
+                    $identity = TenantIdentity::first();
+
+                    return response()->json([
+                        'status' => 'ok',
+                        'company_id' => $identity ? (int) $identity->company_id : null,
+                        'tax_id' => $identity?->tax_id,
+                        'schema_version' => $identity?->schema_version,
+                        'is_connection_open' => $manager->isConnectionOpen(),
+                    ]);
+                })->middleware('company.can:inventory.products.view,read_only')->name('company.diagnostic.identity');
+
+                Route::get('diagnostic/commercial-query', function () {
+                    /** @var TenantIdentity|null $identity */
+                    $identity = TenantIdentity::first();
+
+                    return response()->json([
+                        'status' => 'ok',
+                        'company_id' => $identity ? (int) $identity->company_id : null,
+                        'tax_id' => $identity?->tax_id,
+                    ]);
+                })->middleware('company.can:inventory.products.view,read_only')->name('company.diagnostic.query');
+            }
+
+            // Product Catalog Routes
+            Route::prefix('catalog')->group(function () {
+                Route::get('/', [ProductCatalogController::class, 'index'])
+                    ->middleware('company.can:inventory.products.view,read_only')
+                    ->name('company.catalog.index');
+
+                // Categories
+                Route::post('categories', [CategoryController::class, 'store'])
+                    ->middleware('company.can:inventory.categories.manage,mutable')
+                    ->name('company.catalog.categories.store');
+
+                Route::put('categories/{category}', [CategoryController::class, 'update'])
+                    ->middleware('company.can:inventory.categories.manage,mutable')
+                    ->name('company.catalog.categories.update');
+
+                Route::patch('categories/{category}/status', [CategoryController::class, 'setStatus'])
+                    ->middleware('company.can:inventory.categories.manage,mutable')
+                    ->name('company.catalog.categories.status');
+
+                // Units of measure
+                Route::post('units', [UnitOfMeasureController::class, 'store'])
+                    ->middleware('company.can:inventory.units.manage,mutable')
+                    ->name('company.catalog.units.store');
+
+                Route::put('units/{unit}', [UnitOfMeasureController::class, 'update'])
+                    ->middleware('company.can:inventory.units.manage,mutable')
+                    ->name('company.catalog.units.update');
+
+                Route::patch('units/{unit}/status', [UnitOfMeasureController::class, 'setStatus'])
+                    ->middleware('company.can:inventory.units.manage,mutable')
+                    ->name('company.catalog.units.status');
+
+                // Products
+                Route::post('products', [ProductController::class, 'store'])
+                    ->middleware('company.can:inventory.products.manage,mutable')
+                    ->name('company.catalog.products.store');
+
+                Route::put('products/{product}', [ProductController::class, 'update'])
+                    ->middleware('company.can:inventory.products.manage,mutable')
+                    ->name('company.catalog.products.update');
+
+                Route::patch('products/{product}/status', [ProductController::class, 'setStatus'])
+                    ->middleware('company.can:inventory.products.manage,mutable')
+                    ->name('company.catalog.products.status');
+            });
+        });
+
+        // Commercial test endpoints to prove authorization enforcement (central policy evaluation)
         Route::get('test/inventory/view', fn () => response()->json([
             'status' => 'ok',
             'action' => 'inventory.products.view',

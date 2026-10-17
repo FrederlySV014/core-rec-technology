@@ -32,6 +32,8 @@ class CentralRoleTemplateSeeder extends Seeder
                     'commercial.members.manage',
                     'inventory.products.view',
                     'inventory.products.manage',
+                    'inventory.categories.manage',
+                    'inventory.units.manage',
                     'inventory.stock.view',
                     'inventory.stock.adjust',
                     'purchases.orders.view',
